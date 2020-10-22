@@ -55,7 +55,7 @@ class RegMasternodeDlg(QDialog, ui_reg_masternode_dlg.Ui_RegMasternodeDlg, WndUt
                  on_proregtx_success_callback: Callable):
         QDialog.__init__(self, main_dlg)
         ui_reg_masternode_dlg.Ui_RegMasternodeDlg.__init__(self)
-        WndUtils.__init__(self, main_dlg.config)
+        WndUtils.__init__(self, main_dlg.app_config)
         self.main_dlg = main_dlg
         self.masternode = masternode
         self.app_config = config
@@ -925,7 +925,8 @@ class RegMasternodeDlg(QDialog, ui_reg_masternode_dlg.Ui_RegMasternodeDlg, WndUt
             ret = WndUtils.run_thread_dialog(self.get_collateral_tx_address_thread, (check_break_scanning,), True,
                                              force_close_dlg_callback=do_break_scanning)
         except Exception as e:
-            pass
+            log.exception(str(e))
+            raise Exception(str(e))
         self.btnContinue.setEnabled(True)
         return ret
 

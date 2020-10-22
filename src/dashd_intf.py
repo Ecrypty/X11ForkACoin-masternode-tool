@@ -19,7 +19,7 @@ from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException, EncodeDecim
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from paramiko import AuthenticationException, PasswordRequiredException, SSHException
-from paramiko.ssh_exception import NoValidConnectionsError
+from paramiko.ssh_exception import NoValidConnectionsError, BadAuthenticationType
 from typing import List, Dict, Union, Callable, Optional
 import app_cache
 from app_config import AppConfig
@@ -154,7 +154,8 @@ class DashdConnectionError(Exception):
 
 
 class DashdSSH(object):
-    def __init__(self, host, port, username, on_connection_broken_callback=None):
+    def __init__(self, host, port, username, on_connection_broken_callback=None, auth_method: str = 'password',
+                 private_key_path: str = ''):
         self.host = host
         self.port = port
         self.username = username
@@ -164,6 +165,8 @@ class DashdSSH(object):
         self.connected = False
         self.connection_broken = False
         self.ssh_thread = None
+        self.auth_method = auth_method  #  'any', 'password', 'key_pair', 'ssh_agent'
+        self.private_key_path = private_key_path
         self.on_connection_broken_callback = on_connection_broken_callback
 
     def __del__(self):
@@ -200,7 +203,7 @@ class DashdSSH(object):
             if channel:
                 channel.close()
 
-    def connect(self):
+    def connect(self) -> bool:
         import paramiko
         if self.ssh is None:
             self.ssh = paramiko.SSHClient()
@@ -210,11 +213,26 @@ class DashdSSH(object):
 
         while True:
             try:
-                self.ssh.connect(self.host, port=int(self.port), username=self.username, password=password)
+                if self.auth_method == 'any':
+                    self.ssh.connect(self.host, port=int(self.port), username=self.username, password=password)
+                elif self.auth_method == 'password':
+                    self.ssh.connect(self.host, port=int(self.port), username=self.username, password=password,
+                                     look_for_keys=False, allow_agent=False)
+                elif self.auth_method == 'key_pair':
+                    if not self.private_key_path:
+                        raise Exception('No RSA private key path was provided.')
+
+                    self.ssh.connect(self.host, port=int(self.port), username=self.username, password=password,
+                                     key_filename=self.private_key_path, look_for_keys=False, allow_agent=False)
+                elif self.auth_method == 'ssh_agent':
+                    self.ssh.connect(self.host, port=int(self.port), username=self.username, password=password,
+                                     look_for_keys=False, allow_agent=True)
+
                 self.connected = True
                 if password:
                     SshPassCache.save_password(self.username, self.host, password)
                 break
+
             except PasswordRequiredException as e:
                 # private key with password protection is used; ask user for password
                 pass_message = "Enter passphrase for <b>private key</b> or password for %s" % \
@@ -224,6 +242,9 @@ class DashdSSH(object):
                     if password:
                         break
 
+            except BadAuthenticationType as e:
+                raise Exception(str(e))
+
             except AuthenticationException as e:
                 # This exception will be raised in the following cases:
                 #  1. a private key with password protectection is used but the user enters incorrect password
@@ -232,8 +253,13 @@ class DashdSSH(object):
                 # So, in the first case, the second query for password will ask for normal password to server, not
                 #  for a private key.
 
-                if password is not None:
-                    WndUtils.errorMsg(message='Incorrect password, try again...')
+                if self.auth_method == 'key_pair':
+                    WndUtils.errorMsg(message=f'Authentication failed for private key: {self.private_key_path} '
+                    f'(username {self.username}).')
+                    break
+                else:
+                    if password is not None:
+                        WndUtils.errorMsg(message='Incorrect password, try again...')
 
                 while True:
                     password = SshPassCache.get_password(self.username, self.host, message=pass_message)
@@ -249,7 +275,10 @@ class DashdSSH(object):
                 else:
                     raise
             except Exception as e:
+                log.exception(str(e))
                 raise
+
+        return self.connected
 
     def on_tunnel_thread_finish(self):
         self.ssh_thread = None
@@ -458,7 +487,6 @@ def control_rpc_call(_func=None, *, encrypt_rpc_arguments=False, allow_switching
                         raise
             finally:
                 self.http_lock.release()
-                log.debug('Released http_lock')
 
             if last_exception:
                 raise last_exception
@@ -512,7 +540,7 @@ def json_cache_wrapper(func, intf, cache_file_ident, skip_cache=False,
         if intf.app_config.is_testnet():
             fname += 'testnet_'
 
-        cache_file = intf.config.tx_cache_dir + fname + cache_file_ident + '.json'
+        cache_file = intf.app_config.tx_cache_dir + fname + cache_file_ident + '.json'
         if not skip_cache:
             try:  # looking into cache first
                 with open(cache_file) as fp:
@@ -546,7 +574,7 @@ class DashdInterface(WndUtils):
                  on_connection_disconnected_callback=None):
         WndUtils.__init__(self, app_config=None)
 
-        self.config = None
+        self.app_config = None
         self.db_intf = None
         self.connections = []
         self.cur_conn_index = 0
@@ -576,9 +604,10 @@ class DashdInterface(WndUtils):
         self.http_lock = threading.RLock()
 
     def initialize(self, config: AppConfig, connection=None, for_testing_connections_only=False):
-        self.config = config
         self.app_config = config
-        self.db_intf = self.config.db_intf
+        self.app_config = config
+        self.app_config = config
+        self.db_intf = self.app_config.db_intf
 
         # conn configurations are used from the first item in the list; if one fails, then next is taken
         if connection:
@@ -586,7 +615,7 @@ class DashdInterface(WndUtils):
             self.connections = [connection]
         else:
             # get connection list orderd by priority of use
-            self.connections = self.config.get_ordered_conn_list()
+            self.connections = self.app_config.get_ordered_conn_list()
 
         self.cur_conn_index = 0
         if self.connections:
@@ -609,7 +638,7 @@ class DashdInterface(WndUtils):
             db_correction_duration = 0.0
             log.debug("Reading masternodes' data from DB")
             cur.execute("SELECT id, ident, status, payee, last_seen, active_seconds,"
-                        " last_paid_time, last_paid_block, IP from MASTERNODES where dmt_active=1")
+                        " last_paid_time, last_paid_block, IP, queue_position from MASTERNODES where dmt_active=1")
             for row in cur.fetchall():
                 db_id = row[0]
                 ident = row[1]
@@ -636,6 +665,7 @@ class DashdInterface(WndUtils):
                 mn.lastpaidtime = row[6]
                 mn.lastpaidblock = row[7]
                 mn.ip = row[8]
+                mn.queue_position = row[9]
                 self.masternodes.append(mn)
                 self.masternodes_by_ident[mn.ident] = mn
                 self.masternodes_by_ip_port[mn.ip] = mn
@@ -657,7 +687,7 @@ class DashdInterface(WndUtils):
 
         # get connection list orderd by priority of use
         self.disconnect()
-        self.connections = self.config.get_ordered_conn_list()
+        self.connections = self.app_config.get_ordered_conn_list()
         self.cur_conn_index = 0
         if len(self.connections):
             self.cur_conn_def = self.connections[self.cur_conn_index]
@@ -686,7 +716,7 @@ class DashdInterface(WndUtils):
         :return: True if successfully switched or False if there was no another config
         """
         if self.cur_conn_def:
-            self.config.conn_cfg_failure(self.cur_conn_def)  # mark connection as defective
+            self.app_config.conn_cfg_failure(self.cur_conn_def)  # mark connection as defective
         if self.cur_conn_index < len(self.connections)-1:
             idx = self.cur_conn_index + 1
         else:
@@ -708,7 +738,7 @@ class DashdInterface(WndUtils):
 
     def mark_cur_conn_cfg_is_ok(self):
         if self.cur_conn_def:
-            self.config.conn_cfg_success(self.cur_conn_def)
+            self.app_config.conn_cfg_success(self.cur_conn_def)
 
     def open(self):
         """
@@ -775,7 +805,9 @@ class DashdInterface(WndUtils):
                 # RPC over SSH
                 if self.ssh is None:
                     self.ssh = DashdSSH(self.cur_conn_def.ssh_conn_cfg.host, self.cur_conn_def.ssh_conn_cfg.port,
-                                        self.cur_conn_def.ssh_conn_cfg.username)
+                                        self.cur_conn_def.ssh_conn_cfg.username,
+                                        auth_method=self.cur_conn_def.ssh_conn_cfg.auth_method,
+                                        private_key_path=self.cur_conn_def.ssh_conn_cfg.private_key_path)
                 try:
                     log.debug('starting ssh.connect')
                     self.ssh.connect()
@@ -883,13 +915,13 @@ class DashdInterface(WndUtils):
     @control_rpc_call
     def getinfo(self, verify_node: bool = True):
         if self.open():
-            info = self.proxy.getinfo()
+            info = self.proxy.getblockchaininfo()
             if verify_node:
-                node_under_testnet = info.get('testnet')
-                if self.config.is_testnet() and not node_under_testnet:
+                node_under_testnet = (info.get('chain') == 'test')
+                if self.app_config.is_testnet() and not node_under_testnet:
                     raise Exception('This RPC node works under Dash MAINNET, but your current configuration is '
                                     'for TESTNET.')
-                elif self.config.is_mainnet() and node_under_testnet:
+                elif self.app_config.is_mainnet() and node_under_testnet:
                     raise Exception('This RPC node works under Dash TESTNET, but your current configuration is '
                                     'for MAINNET.')
             return info
@@ -950,34 +982,36 @@ class DashdInterface(WndUtils):
                 self.protx_by_mn_ident[ident] = p
         return self.protx_by_mn_ident
 
-    def update_mn_queue_values(self):
+    def update_mn_queue_values(self, masternodes: List[Masternode]):
         """
         Updates masternode payment queue order values.
         """
 
         payment_queue = []
-        for mn in self.masternodes:
+        for mn in masternodes:
             if mn.status == 'ENABLED':
                 protx = self.protx_by_mn_ident.get(mn.ident)
 
                 if mn.lastpaidblock > 0:
                     mn.queue_position = mn.lastpaidblock
-                    if protx:
-                        pose_revived_height = protx.get('pose_revived_height', 0)
-                        if pose_revived_height > 0:
-                            mn.queue_position = pose_revived_height
                 else:
                     if protx:
                         mn.queue_position = protx.get('registered_height')
                     else:
                         mn.queue_position = None
+
+                if protx:
+                    pose_revived_height = protx.get('pose_revived_height', 0)
+                    if pose_revived_height > 0 and pose_revived_height > mn.lastpaidblock:
+                        mn.queue_position = pose_revived_height
+
                 payment_queue.append(mn)
             else:
                 mn.queue_position = None
 
         payment_queue.sort(key=lambda x: x.queue_position, reverse=False)
 
-        for mn in self.masternodes:
+        for mn in masternodes:
             if mn.status == 'ENABLED':
                 mn.queue_position = payment_queue.index(mn)
 
@@ -1031,6 +1065,7 @@ class DashdInterface(WndUtils):
                 else:
                     mns = self.proxy.masternodelist(*args)
                     mns = parse_mns(mns)
+                    self.update_mn_queue_values(mns)
 
                     # mark already cached masternodes to identify those to delete
                     for mn in self.masternodes:
@@ -1056,11 +1091,12 @@ class DashdInterface(WndUtils):
                                     cur.execute(
                                         "INSERT INTO MASTERNODES(ident, status, payee, last_seen,"
                                         " active_seconds, last_paid_time, last_paid_block, ip, protx_hash, "
-                                        " registered_height, dmt_active, dmt_create_time) "
-                                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                        " registered_height, dmt_active, dmt_create_time, queue_position) "
+                                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                         (mn.ident, mn.status, mn.payee, mn.lastseen,
                                          mn.activeseconds, mn.lastpaidtime, mn.lastpaidblock, mn.ip, mn.protx_hash,
-                                         mn.registered_height, 1, datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                                         mn.registered_height, 1, datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                         mn.queue_position))
                                     mn.db_id = cur.lastrowid
                                     db_modified = True
                             else:
@@ -1077,16 +1113,17 @@ class DashdInterface(WndUtils):
                                 existing_mn.ip = mn.ip
                                 existing_mn.protx_hash = mn.protx_hash
                                 existing_mn.registered_height = mn.registered_height
+                                existing_mn.queue_position = mn.queue_position
 
                                 # ... and finally update MN db record
                                 if existing_mn.modified:
                                     cur.execute(
                                         "UPDATE MASTERNODES set ident=?, status=?, payee=?, last_seen=?, "
                                         "active_seconds=?, last_paid_time=?, last_paid_block=?, ip=?, protx_hash=?, "
-                                        "registered_height=? WHERE id=?",
+                                        "registered_height=?, queue_position=? WHERE id=?",
                                         (mn.ident, mn.status, mn.payee, mn.lastseen, mn.activeseconds,
                                          mn.lastpaidtime, mn.lastpaidblock, mn.ip, mn.protx_hash, mn.registered_height,
-                                         existing_mn.db_id))
+                                         existing_mn.queue_position, existing_mn.db_id))
                                     db_modified = True
 
                         # remove from the cache masternodes that no longer exist
@@ -1102,7 +1139,6 @@ class DashdInterface(WndUtils):
                                 self.masternodes_by_ident.pop(mn.ident,0)
                                 del self.masternodes[mn_index]
 
-                        self.update_mn_queue_values()
                         app_cache.set_value(f'MasternodesLastReadTime_{self.app_config.dash_network}', int(time.time()))
 
                     finally:
@@ -1325,18 +1361,21 @@ class DashdInterface(WndUtils):
 
         try:
             cur_mempool_txes = self.getrawmempool()
-            for tx_hash in cur_mempool_txes:
-                tx = self.mempool_txes.get(tx_hash)
-                if not tx:
-                    tx = self.getrawtransaction(tx_hash, True, skip_cache=True)
-                    self.mempool_txes[tx_hash] = tx
-                protx = tx.get('proUpRegTx')
-                if not protx:
-                    protx = tx.get('proUpRevTx')
-                if not protx:
-                    protx = tx.get('proUpServTx')
-                if protx and protx.get('proTxHash') == proregtx_hash:
-                    return True
+            if len(cur_mempool_txes) < 200:
+                for tx_hash in cur_mempool_txes:
+                    tx = self.mempool_txes.get(tx_hash)
+                    if not tx:
+                        tx = self.getrawtransaction(tx_hash, True, skip_cache=True)
+                        self.mempool_txes[tx_hash] = tx
+                    protx = tx.get('proUpRegTx')
+                    if not protx:
+                        protx = tx.get('proUpRevTx')
+                    if not protx:
+                        protx = tx.get('proUpServTx')
+                    if protx and protx.get('proTxHash') == proregtx_hash:
+                        return True
+            else:
+                log.warning('Mempool to large to scan for protx transaction. Skipping...')
             return False
         except Exception as e:
             return False
